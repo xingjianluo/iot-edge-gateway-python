@@ -12,6 +12,7 @@ import threading
 from dataclasses import dataclass, field
 
 from .buffer import BoundedSpool
+from .config import GatewayConfig, config_from_env
 from .dedup import DeviceSequencer
 from .devices import RawMessage
 from .downstream import DownstreamUnavailable, MockDownstream
@@ -53,12 +54,32 @@ class Gateway:
 
     def __init__(
         self,
+        config: GatewayConfig | None = None,
         *,
-        window_size: int = 32,
-        spool_capacity: int = 100,
-        overflow_policy: str = "drop_newest",
+        window_size: int | None = None,
+        spool_capacity: int | None = None,
+        overflow_policy: str | None = None,
         downstream: MockDownstream | None = None,
     ) -> None:
+        if config is None:
+            config = config_from_env()
+        # 显式关键字参数覆盖配置对象，便于测试
+        window_size = (
+            config.window_size if window_size is None else window_size
+        )
+        spool_capacity = (
+            config.spool_capacity if spool_capacity is None else spool_capacity
+        )
+        overflow_policy = (
+            config.overflow_policy
+            if overflow_policy is None else overflow_policy
+        )
+        self.config = GatewayConfig(
+            window_size=window_size,
+            spool_capacity=spool_capacity,
+            overflow_policy=overflow_policy,
+        ).validated()
+
         self.sequencer = DeviceSequencer(window_size=window_size)
         self.spool = BoundedSpool(
             capacity=spool_capacity, overflow_policy=overflow_policy,
