@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from .config import config_from_env
 from .devices import SimulatedDevice
 from .gateway import Gateway
 
@@ -29,10 +30,18 @@ def _print_result(result, label: str) -> None:
 
 def run_demo() -> None:
     """跑一遍确定性剧本并打印结论与最终统计。"""
-    gw = Gateway(window_size=8, spool_capacity=4)
+    config = config_from_env()
+    gw = Gateway(
+        config=config, window_size=8, spool_capacity=4,
+    )
     reg_dev = SimulatedDevice("line-A/temp", protocol="register")
     json_dev = SimulatedDevice("line-B/vibe", protocol="structured")
 
+    print(
+        f"=== config: window_size={gw.config.window_size} "
+        f"spool_capacity={gw.config.spool_capacity} "
+        f"overflow_policy={gw.config.overflow_policy} ==="
+    )
     print("=== 1) 双协议正常接入（乱序：先 1 后 0）===")
     for msg in (reg_dev.emit(1), json_dev.emit(0), reg_dev.emit(0)):
         _print_result(gw.ingest(msg), msg.label)
