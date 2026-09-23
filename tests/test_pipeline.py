@@ -5,8 +5,6 @@
 
 import threading
 
-import pytest
-
 from edge_gateway.devices import SimulatedDevice
 from edge_gateway.downstream import DownstreamUnavailable
 from edge_gateway.gateway import Gateway
