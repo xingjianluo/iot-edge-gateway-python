@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .models import DedupDecision, RejectReason
@@ -35,14 +36,28 @@ class _DeviceState:
 
 
 class DeviceSequencer:
-    """每设备独立状态 + 独立锁。"""
+    """每设备独立状态 + 独立锁。
 
-    def __init__(self, window_size: int = 32) -> None:
+    乱序窗口按设备解析：window_for(device_id) 返回该设备的 W；
+    不提供时所有设备统一用构造参数 window_size。
+    """
+
+    def __init__(
+        self,
+        window_size: int = 32,
+        *,
+        window_for: Callable[[str], int] | None = None,
+    ) -> None:
         if window_size < 1:
             raise ValueError("window_size must be >= 1")
         self.window_size = window_size
+        self._window_for = window_for or (lambda _device: window_size)
         self._states: dict[str, _DeviceState] = {}
         self._registry_lock = threading.Lock()
+
+    def effective_window(self, device_id: str) -> int:
+        """该设备实际生效的乱序窗口大小。"""
+        return self._window_for(device_id)
 
     def _state(self, device_id: str) -> _DeviceState:
         st = self._states.get(device_id)
@@ -64,20 +79,22 @@ class DeviceSequencer:
             wm_before = st.watermark
             prev_seen = st.last_seen_seq
             st.last_seen_seq = seq
+            window = self._window_for(device_id)
 
             if seq > st.watermark:
                 # 前向推进（允许跳号），水位单调上升
                 st.seen.add(seq)
                 st.watermark = seq
-                self._prune(st)
+                self._prune(st, window)
                 return DedupDecision(
                     accepted=True,
                     watermark_before=wm_before,
                     watermark_after=st.watermark,
+                    window_size=window,
                 )
 
             # seq <= watermark：落在当前水位及以前
-            low = st.watermark - self.window_size + 1
+            low = st.watermark - window + 1
             if seq < low:
                 reason = (
                     RejectReason.SEQ_ROLLBACK
@@ -88,6 +105,7 @@ class DeviceSequencer:
                     accepted=False, reason=reason,
                     watermark_before=wm_before,
                     watermark_after=st.watermark,
+                    window_size=window,
                 )
 
             if seq in st.seen:
@@ -95,6 +113,7 @@ class DeviceSequencer:
                     accepted=False, reason=RejectReason.DUPLICATE_SEQ,
                     watermark_before=wm_before,
                     watermark_after=st.watermark,
+                    window_size=window,
                 )
 
             # 窗口内乱序补缺：接受，但水位不移动（单调）
@@ -103,14 +122,52 @@ class DeviceSequencer:
                 accepted=True,
                 watermark_before=wm_before,
                 watermark_after=st.watermark,
+                window_size=window,
             )
 
-    def _prune(self, st: _DeviceState) -> None:
+    def _prune(self, st: _DeviceState, window: int) -> None:
         """水位推进后淘汰窗口外成员，seen 大小被钳制在 O(window_size)。"""
-        low = st.watermark - self.window_size + 1
+        low = st.watermark - window + 1
         if low > 0:
             st.seen = {s for s in st.seen if s >= low}
 
     def watermark(self, device_id: str) -> int:
         """返回设备当前水位（无数据时为 -1）。"""
         return self._state(device_id).watermark
+
+    def export_state(self) -> dict:
+        """导出每设备时序状态（快照用，仅运行状态，无锁/无配置）。"""
+        out: dict[str, dict] = {}
+        for device_id, st in self._states.items():
+            with st.lock:
+                out[device_id] = {
+                    "watermark": st.watermark,
+                    "last_seen_seq": st.last_seen_seq,
+                    "seen": sorted(st.seen),
+                }
+        return out
+
+    def import_state(self, data: dict) -> None:
+        """从快照数据恢复（全新进程调用：重建全部设备状态）。"""
+        if not isinstance(data, dict):
+            raise TypeError("sequencer snapshot must be an object")
+        states: dict[str, _DeviceState] = {}
+        for device_id, body in data.items():
+            if not isinstance(device_id, str) or not isinstance(body, dict):
+                raise TypeError("sequencer device entry malformed")
+            watermark = body["watermark"]
+            last_seen = body["last_seen_seq"]
+            seen = body["seen"]
+            if not isinstance(watermark, int) or watermark < -1:
+                raise ValueError("watermark must be int >= -1")
+            if not isinstance(last_seen, int) or last_seen < -1:
+                raise ValueError("last_seen_seq must be int >= -1")
+            if not all(isinstance(s, int) and s >= 0 for s in seen):
+                raise ValueError("seen must be non-negative ints")
+            states[device_id] = _DeviceState(
+                watermark=watermark,
+                last_seen_seq=last_seen,
+                seen=set(seen),
+            )
+        with self._registry_lock:
+            self._states = states

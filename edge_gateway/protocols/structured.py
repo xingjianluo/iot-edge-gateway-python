@@ -59,6 +59,17 @@ class StructuredDecoder:
 
     name = "structured"
 
+    def sniff(self, raw: bytes | bytearray | str) -> bool:
+        """结构签名：可解为 UTF-8 文本，首个非空白字符为 '{'。"""
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                text = bytes(raw).decode("utf-8")
+            except UnicodeDecodeError:
+                return False
+        else:
+            text = raw
+        return bool(text.lstrip()[:1] == "{")
+
     def decode(self, raw: bytes | bytearray | str) -> DecodeResult:
         if isinstance(raw, (bytes, bytearray)):
             try:

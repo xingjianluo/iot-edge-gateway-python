@@ -1,4 +1,4 @@
-"""本地端到端演示：异常链路下的接入、去重、缓冲与恢复。
+"""本地端到端演示：自动识别、按设备策略、异常链路与重启恢复。
 
 运行：uv run python main.py
 """
@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 from .config import config_from_env
-from .devices import SimulatedDevice
+from .devices import SimulatedDevice, auto_message
 from .gateway import Gateway
+from .policies import DevicePolicy
+from .snapshot import load_snapshot_file, save_snapshot
 
 
 def _print_result(result, label: str) -> None:
@@ -19,69 +21,98 @@ def _print_result(result, label: str) -> None:
         dest = " ->downstream"
     elif result.buffered:
         dest = " ->spool"
+    detected = f" [{result.detected_protocol}]" if result.detected_protocol else ""
     print(
-        f"  [{verdict:6s}] {label:34s} seq={str(result.seq):>4s} "
+        f"  [{verdict:6s}] {label:32s} seq={str(result.seq):>4s} "
         f"wm={str(result.watermark):>4s} stage={result.stage:9s} "
-        f"reason={reason:18s}{dest}"
+        f"reason={reason:22s}{dest}{detected}"
     )
     if not result.ok and result.detail:
         print(f"             └─ {result.detail}")
 
 
-def run_demo() -> None:
-    """跑一遍确定性剧本并打印结论与最终统计。"""
-    config = config_from_env()
+def run_demo(snapshot_path: str = "/tmp/gw-snapshot.json") -> None:
+    """跑一遍确定性剧本并打印结论、快照恢复与最终统计。"""
+    env_config = config_from_env()
+    # 合并演示用的按设备覆盖（环境变量给的同设备覆盖优先）
+    device_policies = {
+        "tight-line": DevicePolicy(
+            window_size=2, spool_capacity=2, overflow_policy="drop_oldest",
+        ),
+    }
+    device_policies.update(env_config.device_policies)
     gw = Gateway(
-        config=config, window_size=8, spool_capacity=4,
+        config=type(env_config)(
+            window_size=env_config.window_size,
+            spool_capacity=env_config.spool_capacity,
+            overflow_policy=env_config.overflow_policy,
+            device_policies=device_policies,
+        ),
     )
     reg_dev = SimulatedDevice("line-A/temp", protocol="register")
     json_dev = SimulatedDevice("line-B/vibe", protocol="structured")
+    tight_dev = SimulatedDevice("tight-line", protocol="register")
 
     print(
         f"=== config: window_size={gw.config.window_size} "
         f"spool_capacity={gw.config.spool_capacity} "
-        f"overflow_policy={gw.config.overflow_policy} ==="
+        f"overflow_policy={gw.config.overflow_policy} "
+        f"device_policies={sorted(gw.config.device_policies)} ==="
     )
-    print("=== 1) 双协议正常接入（乱序：先 1 后 0）===")
-    for msg in (reg_dev.emit(1), json_dev.emit(0), reg_dev.emit(0)):
+
+    print("=== 1) 协议自行判别（auto：只给原始字节）===")
+    for msg in (
+        auto_message(reg_dev.emit(0).payload, "auto register#0"),
+        auto_message(json_dev.emit(0).payload, "auto structured#0"),
+        auto_message(b"\x00\x01mystery-bytes", "auto unknown"),
+        auto_message(reg_dev.emit(9, corrupt="bad_crc").payload,
+                     "auto register#9 badcrc"),
+    ):
         _print_result(gw.ingest(msg), msg.label)
 
-    print("=== 2) 重复序号（只计一次）===")
-    msg = reg_dev.emit(1)  # 重复
-    _print_result(gw.ingest(msg), msg.label + " replay")
-
-    print("=== 3) 畸形帧矩阵（绝不静默丢弃）===")
-    for corrupt in ("truncate", "bad_crc", "bad_magic",
-                    "missing_field", "bad_value", "malformed"):
-        msg = reg_dev.emit(2, corrupt=corrupt)
-        _print_result(gw.ingest(msg), msg.label)
-    msg = json_dev.emit(2, corrupt="missing_field")
+    print("=== 2) 老路径：显式指定协议仍然可用 ===")
+    msg = reg_dev.emit(1)
     _print_result(gw.ingest(msg), msg.label)
 
-    print("=== 4) 下游中断：3..6 进入边界缓冲（容量 4），7/8 溢出 ===")
+    print("=== 3) 按设备策略：tight-line 窗口=2 容量=2 drop_oldest ===")
     gw.downstream.set_available(False)
-    for s in (3, 4, 5, 6):
-        msg = reg_dev.emit(s)
-        _print_result(gw.ingest(msg), msg.label)
-    for s in (7, 8):
-        msg = reg_dev.emit(s)
-        _print_result(gw.ingest(msg), msg.label)
+    for s in (0, 1, 2, 3):
+        _print_result(gw.ingest(tight_dev.emit(s)), tight_dev.emit(s).label)
+    resolved = gw.policy_resolver.resolve("tight-line")
+    print(
+        f"  effective policy for tight-line: window={resolved.window_size} "
+        f"capacity={resolved.spool_capacity} overflow={resolved.overflow_policy}",
+    )
 
-    print("=== 5) 迟到超窗与序号回退 ===")
-    # 水位已到 8，窗口 [1,8]：seq=0 超窗且相对上一条(8)回退
-    msg = reg_dev.emit(0)
-    _print_result(gw.ingest(msg), msg.label + " late")
+    print("=== 4) 落快照并在全新网关中恢复 ===")
+    save_snapshot(gw, snapshot_path)
+    snap = load_snapshot_file(snapshot_path)
+    gw2 = Gateway.restore_from_snapshot(snap, config=gw.config)
+    gw2.downstream.set_available(False)
+    before = gw.stats_snapshot()
+    after = gw2.stats_snapshot()
+    counts_match = (
+        (before.total_in, before.accepted, before.delivered)
+        == (after.total_in, after.accepted, after.delivered)
+    )
+    print(f"  restored counts match: {counts_match}")
+    print(f"  restored watermarks={after.watermarks}")
+    print(f"  restored spool seqs={[r.seq for r in gw2.spool._q]}")
 
-    print("=== 6) 下游恢复：按序补发 3,4,5,6 ===")
-    gw.downstream.set_available(True)
-    n = gw.on_downstream_recovered()
+    print("=== 5) 重放已交付/已排队读数：不回退、不重复 ===")
+    for s in (0, 1):
+        _print_result(gw2.ingest(reg_dev.emit(s)), f"replay line-A#{s}")
+    for s in (2, 3):
+        _print_result(gw2.ingest(tight_dev.emit(s)), f"replay tight#{s}")
+
+    print("=== 6) 下游恢复：按序补发缓存 ===")
+    gw2.downstream.set_available(True)
+    n = gw2.on_downstream_recovered()
     print(f"  flushed={n}")
-    print(f"  downstream line-A/temp received seqs: "
-          f"{gw.downstream.delivered_seqs('line-A/temp')}")
 
-    print("=== 7) 最终统计 ===")
-    st = gw.stats_snapshot()
-    sp = gw.spool.snapshot_stats()
+    print("=== 7) 最终统计（恢复后的进程）===")
+    st = gw2.stats_snapshot()
+    sp = gw2.spool.snapshot_stats()
     print(f"  total_in={st.total_in} accepted={st.accepted} "
           f"rejected={st.rejected}")
     print(f"  decode_rejected={st.decode_rejected} duplicate={st.duplicate} "

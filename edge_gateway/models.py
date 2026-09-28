@@ -16,6 +16,8 @@ class RejectReason(str, Enum):
     FIELD_MISSING = "FIELD_MISSING"              # 必填字段缺失
     BAD_VALUE = "BAD_VALUE"                      # 字段类型/取值非法
     MALFORMED = "MALFORMED"                      # 结构性报文无法解析
+    UNRECOGNIZED_PROTOCOL = "UNRECOGNIZED_PROTOCOL"  # 自动识别：无任何编码命中
+    AMBIGUOUS_PROTOCOL = "AMBIGUOUS_PROTOCOL"        # 自动识别：多种编码同时命中
 
     # --- 序号/水位阶段 ---
     DUPLICATE_SEQ = "DUPLICATE_SEQ"              # 重复序号（窗口内）
@@ -54,6 +56,7 @@ class DedupDecision:
     reason: RejectReason | None = None
     watermark_before: int = 0
     watermark_after: int = 0
+    window_size: int = 0  # 本次判定实际生效的（按设备）窗口大小，便于日志说明
 
 
 @dataclass

@@ -21,9 +21,14 @@ from .protocols.structured import encode_structured
 class RawMessage:
     """设备侧发出的原始报文及其协议与可读标签。"""
 
-    protocol: str  # "register" | "structured"
+    protocol: str  # "register" | "structured" | "auto"（自行判别）
     payload: bytes
     label: str
+
+
+def auto_message(payload: bytes, label: str = "auto") -> RawMessage:
+    """构造"协议自行判别"报文：只给原始字节，不告诉网关编码。"""
+    return RawMessage(protocol="auto", payload=payload, label=label)
 
 
 class SimulatedDevice:

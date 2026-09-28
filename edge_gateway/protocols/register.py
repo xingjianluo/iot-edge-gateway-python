@@ -87,6 +87,13 @@ class RegisterFrameDecoder:
 
     name = "register"
 
+    def sniff(self, raw: bytes | bytearray | str) -> bool:
+        """结构签名：二进制且首 2 字节为帧头魔数 5A A5。"""
+        if isinstance(raw, str):
+            return False
+        data = bytes(raw)
+        return len(data) >= 2 and data[:2] == b"\x5a\xa5"
+
     def decode(self, raw: bytes | bytearray | str) -> DecodeResult:
         if isinstance(raw, str):
             return DecodeResult(
