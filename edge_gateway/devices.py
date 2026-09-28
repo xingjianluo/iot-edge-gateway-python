@@ -13,15 +13,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .protocols.identification import AUTO_PROTOCOL
 from .protocols.register import encode_register_frame
 from .protocols.structured import encode_structured
 
 
 @dataclass(frozen=True, slots=True)
 class RawMessage:
-    """设备侧发出的原始报文及其协议与可读标签。"""
+    """设备侧发出的原始报文及其协议与可读标签。
 
-    protocol: str  # "register" | "structured"
+    protocol="auto" 表示设备不声明编码，只交一段原始字节，
+    由网关自行判别（identification.ProtocolIdentifier）。
+    """
+
+    protocol: str  # "register" | "structured" | "auto"
     payload: bytes
     label: str
 
@@ -68,6 +73,24 @@ class SimulatedDevice:
         else:
             payload = self._emit_structured(seq, ts, value, corrupt)
         return RawMessage(protocol=self.protocol, payload=payload, label=label)
+
+    def emit_auto(
+        self,
+        seq: int,
+        *,
+        value: float | None = None,
+        corrupt: str | None = None,
+    ) -> RawMessage:
+        """产生一条"不声明协议"的报文：字节内容与 emit 相同，protocol=auto。
+
+        用于协议自行判别场景：网关只能凭原始字节认出它的编码。
+        """
+        msg = self.emit(seq, value=value, corrupt=corrupt)
+        return RawMessage(
+            protocol=AUTO_PROTOCOL,
+            payload=msg.payload,
+            label=f"auto:{msg.label}",
+        )
 
     def _emit_register(
         self, seq: int, ts: int, value: float, corrupt: str | None,

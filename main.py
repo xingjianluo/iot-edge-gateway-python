@@ -53,6 +53,8 @@ def get_stats() -> dict:
                 "out_of_window": stats.out_of_window,
                 "rollback": stats.rollback,
                 "overflow_dropped": stats.overflow_dropped,
+                "unidentified": stats.unidentified,
+                "ambiguous": stats.ambiguous,
             },
             "delivered": stats.delivered,
             "watermarks": stats.watermarks,

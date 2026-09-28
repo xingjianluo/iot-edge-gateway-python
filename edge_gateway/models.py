@@ -16,6 +16,8 @@ class RejectReason(str, Enum):
     FIELD_MISSING = "FIELD_MISSING"              # 必填字段缺失
     BAD_VALUE = "BAD_VALUE"                      # 字段类型/取值非法
     MALFORMED = "MALFORMED"                      # 结构性报文无法解析
+    UNKNOWN_PROTOCOL = "UNKNOWN_PROTOCOL"        # 自动识别：没有任何协议匹配
+    AMBIGUOUS_PROTOCOL = "AMBIGUOUS_PROTOCOL"    # 自动识别：多种协议同时匹配
 
     # --- 序号/水位阶段 ---
     DUPLICATE_SEQ = "DUPLICATE_SEQ"              # 重复序号（窗口内）
