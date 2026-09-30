@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+
+# --- 协议归属判别（自动识别用）---
+# 单台解码器对一段字节的三种归属判断：
+MATCH = "MATCH"            # 确认属于本协议且完整解码成功
+CORRUPT = "CORRUPT"        # 能确认属于本协议，但帧本身坏了（校验/截断/字段/取值等）
+UNRELATED = "UNRELATED"    # 字节不属于本协议（连"像"都算不上）
 
 
 class RejectReason(str, Enum):
@@ -40,12 +46,34 @@ class Reading:
 
 @dataclass(frozen=True, slots=True)
 class DecodeResult:
-    """协议解码结果：成功携带 reading，失败携带可区分原因。"""
+    """协议解码结果：成功携带 reading，失败携带可区分原因。
+
+    protocol  自动识别命中/认领的协议名；指定协议路径为空串
+    evidence  自动识别为 CORRUPT 时，从字节里实际读到的定位依据
+    """
 
     ok: bool
     reading: Reading | None = None
     reason: RejectReason | None = None
     detail: str = ""
+    protocol: str = ""
+    evidence: dict[str, str | int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class Recognition:
+    """单台解码器对一段原始字节的归属判断。
+
+    kind        MATCH / CORRUPT / UNRELATED
+    result      MATCH 时携带成功 DecodeResult；CORRUPT 时携带该协议自己的
+                可区分帧级拒绝 DecodeResult；UNRELATED 时给出"为何不像本协议"
+    evidence    从字节里实际读出来的定位依据（device_id / seq 等，
+                读不出来的字段不放），用于日志与现场排查，绝不臆造
+    """
+
+    kind: str
+    result: DecodeResult
+    evidence: dict[str, str | int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

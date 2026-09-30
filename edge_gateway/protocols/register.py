@@ -29,7 +29,15 @@ from __future__ import annotations
 
 import struct
 
-from ..models import DecodeResult, Reading, RejectReason
+from ..models import (
+    CORRUPT,
+    MATCH,
+    UNRELATED,
+    DecodeResult,
+    Reading,
+    Recognition,
+    RejectReason,
+)
 
 MAGIC = 0xA55A
 VERSION = 0x01
@@ -188,3 +196,72 @@ class RegisterFrameDecoder:
             source=self.name,
         )
         return DecodeResult(ok=True, reading=reading)
+
+    def recognize(self, raw: bytes | bytearray | str) -> Recognition:
+        """自动识别用：判断这段字节与 register 帧的归属关系。
+
+        归属判据是帧头魔数：
+            头不足 / 魔数不对 -> UNRELATED（它就不是 register 帧）；
+            魔数对但帧坏了   -> CORRUPT，携带 register 自己的可区分拒绝，
+                               并尽量带出从字节里读到的 device_id / seq；
+            魔数对且完整合法 -> MATCH。
+        """
+        if isinstance(raw, str):
+            return Recognition(
+                kind=UNRELATED,
+                result=DecodeResult(
+                    ok=False, reason=RejectReason.MALFORMED,
+                    detail="register frame must be bytes, got str",
+                ),
+            )
+        data = bytes(raw)
+        n = len(data)
+        if n < 2:
+            return Recognition(
+                kind=UNRELATED,
+                result=DecodeResult(
+                    ok=False, reason=RejectReason.TRUNCATED_FRAME,
+                    detail=f"frame shorter than magic: {n} bytes",
+                ),
+            )
+        if struct.unpack_from("<H", data, 0)[0] != MAGIC:
+            return Recognition(
+                kind=UNRELATED,
+                result=DecodeResult(
+                    ok=False, reason=RejectReason.BAD_MAGIC,
+                    detail=(
+                        f"bad magic: 0x"
+                        f"{struct.unpack_from('<H', data, 0)[0]:04X}"
+                    ),
+                ),
+            )
+        result = self.decode(data)
+        return Recognition(
+            kind=MATCH if result.ok else CORRUPT,
+            result=result,
+            evidence=_extract_evidence(data),
+        )
+
+
+def _extract_evidence(data: bytes) -> dict[str, str | int]:
+    """从带正确魔数的字节里尽力读出 device_id / seq，读不出就不放。
+
+    仅做长度防护后的原始读取，不做完整性假设：即便帧随后因截断/校验失败，
+    这两个字段仍可作为现场排查依据。
+    """
+    evidence: dict[str, str | int] = {}
+    n = len(data)
+    if n >= 6:
+        dev_len = struct.unpack_from("<H", data, 4)[0]
+        if 6 + dev_len <= n:
+            try:
+                device_id = data[6:6 + dev_len].decode("ascii")
+                if device_id:
+                    evidence["device_id"] = device_id
+            except UnicodeDecodeError:
+                pass
+            if 6 + dev_len + 4 <= n:
+                evidence["seq"] = struct.unpack_from(
+                    "<I", data, 6 + dev_len,
+                )[0]
+    return evidence

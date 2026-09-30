@@ -62,14 +62,22 @@ def run_demo() -> None:
                 reg_dev.emit_auto(0)):
         _print_result(gw.ingest(msg), msg.label)
 
-    print("=== 1b) 认不出 / 指定协议老路仍然可用 ===")
+    print("=== 1b) 认得出但帧坏 / 认不出 / 指定协议老路 ===")
     from edge_gateway.devices import RawMessage
     from edge_gateway.protocols.identification import AUTO_PROTOCOL
 
+    # 能确认是 register 帧（魔数对），但 CRC 坏：给 register 自己的结论，
+    # 并带出从字节读到的 device/seq；不再被笼统算成"认不出"
+    msg = reg_dev.emit_auto(2, corrupt="bad_crc")
+    _print_result(gw.ingest(msg), msg.label)
+    msg = json_dev.emit_auto(2, corrupt="missing_field")
+    _print_result(gw.ingest(msg), msg.label)
+    # 真正归不到任何已支持编码：单独报认不出
     _print_result(
         gw.ingest(RawMessage(AUTO_PROTOCOL, b"\x00\x01not-anything", "?")),
         "unidentified bytes",
     )
+    # 指定协议老路行为不变
     _print_result(gw.ingest(reg_dev.emit(2)), reg_dev.emit(2).label)
 
     print("=== 2) 重复序号（只计一次）===")
@@ -104,10 +112,22 @@ def run_demo() -> None:
         disk = load_snapshot(path)
         print(
             f"  snapshot: format={disk['format']} v{disk['version']} "
+            f"keys={sorted(k for k in disk if k not in ('stats',))} "
             f"watermarks={disk['stats']['watermarks']} "
-            f"queued={len(disk['spool']['queued'])}"
+            f"queued={len(disk['spool']['queued'])} (无策略字段)"
         )
-        gw2 = restore_gateway(disk)  # 等价于在全新进程里重建
+        # 策略由恢复进程自己的配置决定（含按设备覆盖与缺省回退），
+        # 不从快照读取；这里与重启前网关使用同一套生效配置
+        gw2 = restore_gateway(
+            disk,
+            window_size=8, spool_capacity=4,
+            device_policies={
+                "line-A/temp": DevicePolicy(window_size=3),
+                "line-B/vibe": DevicePolicy(
+                    spool_capacity=2, overflow_policy="drop_oldest",
+                ),
+            },
+        )
         # 重放重启前数据：水位不倒退；窗口内序号 DUPLICATE_SEQ，
         # 过窄窗口外的更旧序号依旧 OUT_OF_WINDOW/ROLLBACK，绝不重新投递
         for s in (0, 1, 3, 4, 5, 6):

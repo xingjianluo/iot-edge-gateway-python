@@ -23,7 +23,15 @@ from __future__ import annotations
 import json
 import math
 
-from ..models import DecodeResult, Reading, RejectReason
+from ..models import (
+    CORRUPT,
+    MATCH,
+    UNRELATED,
+    DecodeResult,
+    Reading,
+    Recognition,
+    RejectReason,
+)
 
 REQUIRED_FIELDS = ("device", "seq", "ts", "metric", "value")
 
@@ -134,4 +142,62 @@ class StructuredDecoder:
                 value=fv,
                 source=self.name,
             ),
+        )
+
+    def recognize(self, raw: bytes | bytearray | str) -> Recognition:
+        """自动识别用：判断这段字节与 structured(JSON) 报文的归属关系。
+
+        归属判据是"能否解析成一个 JSON 对象"：
+            非 UTF-8 / 非合法 JSON / 顶层不是对象 -> UNRELATED；
+            是 JSON 对象但必填字段缺失/取值非法  -> CORRUPT，携带
+                structured 自己的可区分拒绝，并带出能读到的 device/seq；
+            字段完整合法                          -> MATCH。
+        """
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                text = bytes(raw).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                return Recognition(
+                    kind=UNRELATED,
+                    result=DecodeResult(
+                        ok=False, reason=RejectReason.MALFORMED,
+                        detail=f"payload not utf-8: {exc}",
+                    ),
+                )
+        else:
+            text = raw
+
+        try:
+            obj = json.loads(text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return Recognition(
+                kind=UNRELATED,
+                result=DecodeResult(
+                    ok=False, reason=RejectReason.MALFORMED,
+                    detail=f"invalid json: {exc}",
+                ),
+            )
+        if not isinstance(obj, dict):
+            return Recognition(
+                kind=UNRELATED,
+                result=DecodeResult(
+                    ok=False, reason=RejectReason.MALFORMED,
+                    detail=(
+                        f"top-level must be object, got {type(obj).__name__}"
+                    ),
+                ),
+            )
+
+        result = self.decode(text)
+        evidence: dict[str, str | int] = {}
+        device = obj.get("device")
+        if isinstance(device, str) and device:
+            evidence["device_id"] = device
+        seq = obj.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0:
+            evidence["seq"] = seq
+        return Recognition(
+            kind=MATCH if result.ok else CORRUPT,
+            result=result,
+            evidence=evidence,
         )

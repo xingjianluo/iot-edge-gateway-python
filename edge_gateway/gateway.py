@@ -50,7 +50,10 @@ class IngestResult:
     watermark: int | None = None
     delivered: bool = False
     buffered: bool = False
-    protocol: str = ""              # 指定协议；自动识别时为命中的协议名
+    protocol: str = ""              # 指定协议；自动识别时为命中/认领的协议名
+    evidence: dict = field(default_factory=dict)
+    # 自动识别阶段：认得出但帧坏了（区别于认不出/歧义），便于分开看日志
+    claimed_corrupt: bool = False
 
 
 @dataclass
@@ -132,6 +135,8 @@ class Gateway:
         self.identifier = ProtocolIdentifier(default_decoders())
         self._lock = threading.Lock()
         self.stats = GatewayStats()
+        # 已同步进网关统计的缓冲溢出丢弃数（快照恢复后以快照值为基准）
+        self._spool_dropped_seen = 0
 
     def ingest(self, msg: RawMessage) -> IngestResult:
         """处理一条原始报文，返回分阶段、原因可区分的结论。"""
@@ -142,12 +147,9 @@ class Gateway:
             if msg.protocol == AUTO_PROTOCOL:
                 identified = self.identifier.identify(msg.payload)
                 if not identified.ok or identified.reading is None:
-                    return self._reject_identify(
-                        identified.reason or RejectReason.UNKNOWN_PROTOCOL,
-                        identified.detail,
-                    )
+                    return self._reject_identify(identified)
                 reading = identified.reading
-                protocol = reading.source
+                protocol = identified.protocol or reading.source
             else:
                 decoder = self._decoders.get(msg.protocol)
                 if decoder is None:
@@ -203,6 +205,12 @@ class Gateway:
                     pass  # 竞态：检查后被置为不可用，落入缓冲
 
             accepted, reason = self.spool.put(reading)
+            # 同步缓冲层本次可能发生的溢出丢弃（DROP_OLDEST 也会计入），
+            # 保证网关统计与落盘快照都不丢这笔账
+            dropped_now = self.spool.stats.dropped_overflow - self._spool_dropped_seen
+            if dropped_now:
+                self._spool_dropped_seen = self.spool.stats.dropped_overflow
+                self.stats.overflow_dropped += dropped_now
             if not accepted:
                 self.stats.rejected += 1
                 cap = self.policies.spool_capacity_for(reading.device_id)
@@ -223,16 +231,33 @@ class Gateway:
                 watermark=wm, buffered=True, protocol=protocol,
             )
 
-    def _reject_identify(self, reason: RejectReason, detail: str) -> IngestResult:
-        """自动识别阶段的可区分拒绝（认不出 / 歧义分开计数）。"""
-        if reason is RejectReason.AMBIGUOUS_PROTOCOL:
-            self.stats.ambiguous += 1
-        else:
-            self.stats.unidentified += 1
+    def _reject_identify(self, identified) -> IngestResult:
+        """自动识别阶段的可区分拒绝：认不出 / 歧义 / 认得出但帧坏 三者分开。
+
+        - AMBIGUOUS_PROTOCOL -> ambiguous 计数；
+        - UNKNOWN_PROTOCOL   -> unidentified 计数；
+        - 其余帧级原因       -> 某已支持协议的坏帧：decode_rejected 计数，
+          带出协议名与从字节读出的 device_id/seq 依据，既不混入"认不出"，
+          也不静默丢弃或硬挑一种塞进去。
+        """
+        reason = identified.reason or RejectReason.UNKNOWN_PROTOCOL
         self.stats.rejected += 1
         self.stats.decode_rejected += 1
+        claimed_corrupt = False
+        if reason is RejectReason.AMBIGUOUS_PROTOCOL:
+            self.stats.ambiguous += 1
+        elif reason is RejectReason.UNKNOWN_PROTOCOL:
+            self.stats.unidentified += 1
+        else:
+            claimed_corrupt = True
+        evidence = dict(getattr(identified, "evidence", None) or {})
         return IngestResult(
-            ok=False, stage="identify", reason=reason, detail=detail,
+            ok=False, stage="identify", reason=reason,
+            detail=identified.detail, protocol=identified.protocol,
+            evidence=evidence, claimed_corrupt=claimed_corrupt,
+            device_id=str(evidence["device_id"])
+            if "device_id" in evidence else "",
+            seq=evidence.get("seq"),
         )
 
     def on_downstream_recovered(self) -> int:
@@ -272,25 +297,37 @@ class Gateway:
             }
 
     def load_state(self, state: dict) -> None:
-        """从快照恢复运行状态（需用相同配置新建网关后再调用）。"""
+        """从快照恢复运行状态（需用相同配置新建网关后再调用）。
+
+        state 仅允许包含运行状态键（stats/sequencer/spool）；策略设置不
+        属于快照，由进程自身配置（含按设备覆盖与缺省回退）决定。未知字段
+        或凭据类内容由 snapshot.validate_runtime_state 严格拒绝。
+        """
+        from .snapshot import validate_runtime_state
+
+        validate_runtime_state(state)
         with self._lock:
             self.sequencer.load_state(state["sequencer"])
             self.spool.load_state(state["spool"])
-            st = state.get("stats", {})
-            wm = st.get("watermarks", {})
+            st = state["stats"]
+            wm = st["watermarks"]
             self.stats = GatewayStats(
-                total_in=int(st.get("total_in", 0)),
-                accepted=int(st.get("accepted", 0)),
-                rejected=int(st.get("rejected", 0)),
-                decode_rejected=int(st.get("decode_rejected", 0)),
-                duplicate=int(st.get("duplicate", 0)),
-                out_of_window=int(st.get("out_of_window", 0)),
-                rollback=int(st.get("rollback", 0)),
-                overflow_dropped=int(st.get("overflow_dropped", 0)),
-                delivered=int(st.get("delivered", 0)),
-                unidentified=int(st.get("unidentified", 0)),
-                ambiguous=int(st.get("ambiguous", 0)),
+                total_in=int(st["total_in"]),
+                accepted=int(st["accepted"]),
+                rejected=int(st["rejected"]),
+                decode_rejected=int(st["decode_rejected"]),
+                duplicate=int(st["duplicate"]),
+                out_of_window=int(st["out_of_window"]),
+                rollback=int(st["rollback"]),
+                overflow_dropped=int(st["overflow_dropped"]),
+                delivered=int(st["delivered"]),
+                unidentified=int(st["unidentified"]),
+                ambiguous=int(st["ambiguous"]),
                 watermarks={k: int(v) for k, v in wm.items()},
+            )
+            # 以快照里缓冲层的丢弃数为基准，恢复后新增丢弃才会继续累加
+            self._spool_dropped_seen = int(
+                state["spool"]["stats"]["dropped_overflow"],
             )
 
     def stats_snapshot(self) -> GatewayStats:
