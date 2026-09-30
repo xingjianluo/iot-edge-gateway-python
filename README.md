@@ -22,10 +22,10 @@
 │   ├── demo.py                   # 逐条打印序号/水位/判定依据的剧本
 │   └── protocols/
 │       ├── base.py               # 解码器协议接口
-│       ├── identification.py     # 协议自行判别（唯一命中/认不出/歧义）
+│       ├── identification.py     # 协议自行判别（命中/归属坏帧/认不出/歧义）
 │       ├── register.py           # 寄存器风格二进制帧（CRC16/MODBUS）
 │       └── structured.py         # 结构化报文（JSON）
-└── tests/                        # 69 个单测/集成测（识别/设备策略/快照/并发）
+└── tests/                        # 97 个单测/集成测（识别/设备策略/快照/并发）
 ```
 
 ## 1. 支持的协议编码与归一
@@ -65,25 +65,47 @@ FIELD_MISSING / BAD_VALUE`，每条都带 detail 文本（如实际长度、计�
 
 接入侧设备只给一段原始字节时，把 `RawMessage.protocol` 置为 `"auto"`
 （模拟器可用 `device.emit_auto(seq)`），网关 `ProtocolIdentifier` 依次尝试
-全部已注册解码器，按**唯一命中**原则归一：
+全部已注册解码器。判别首先要回答的是**"这串字节属不属于我们支持的某种
+编码"**，而不是只有"解码成功/失败"两档：
 
-| 判别结果 | 结论 | 拒绝原因 |
+| 情形 | 结论 | 拒绝原因 |
 |---|---|---|
 | 恰好 1 种协议解码成功 | 接受，`Reading.source` 标明命中协议；`IngestResult.protocol` 回填协议名 | — |
-| 没有任何协议成功 | 明确拒绝，detail 逐个列出各解码器的失败原因 | **`UNKNOWN_PROTOCOL`** |
-| 2 种及以上同时成功 | 明确拒绝（歧义，绝不二选一硬塞），detail 列出全部命中者 | **`AMBIGUOUS_PROTOCOL`** |
+| 恰好 1 种协议**认得出但帧坏了** | 给该协议自己的、可区分的坏帧结论（见下），并带出能读出的设备/序号依据 | `CHECKSUM_MISMATCH` / `TRUNCATED_FRAME` / `FIELD_MISSING` / `BAD_VALUE` / `MALFORMED` |
+| 没有任何协议认得出 | 明确拒绝，detail 逐个列出各解码器的失败原因 | **`UNKNOWN_PROTOCOL`** |
+| 2 种及以上同时解码成功，或同时"认得出（但都坏了）" | 明确拒绝（歧义，绝不二选一硬塞），detail 列出全部候选 | **`AMBIGUOUS_PROTOCOL`** |
+
+"认得出"（attributable）的标准，解决了"同一段坏字节、声明协议时能定位、
+自动判别时却只回认不出"的对不上问题：
+
+- **register**：帧首 magic `0xA55A` 一旦对得上，就足以确认它是寄存器报文；
+  此后版本非法、长度不符/被截断、CRC 对不上、必填字段为空、取值非法，
+  全部按 **register 坏帧**上报，并把帧里能安全读出的 `device_id`/`seq`
+  放进 `IngestResult.evidence` 一并带出。短于 2 字节、或 magic 对不上的，
+  不能归到 register 头上。
+- **structured**：字节能解析成 JSON **对象**，就足以确认它是结构化报文；
+  此后缺字段、空值、类型/取值非法，全部按 **structured 坏帧**上报，
+  同样带 `device`/`seq` 依据。非 JSON（如被截断到无法解析）、或顶层是
+  数字/数组等非对象，则不能归到 structured 头上。
 
 要点：
 
-- 认不出 ≠ 某种协议的坏帧：例如魔数错误的字节在 register 看来是
-  `BAD_MAGIC`、在 structured 看来是 `MALFORMED`，自动路径给的是
-  `UNKNOWN_PROTOCOL`——"我们认不出这是什么"，不会瞎猜一种硬塞。
+- **坏帧 ≠ 认不出**：CRC 错、被截断、缺字段、取值非法这些"我们支持的编码
+  发坏了"的现场，自动路径给的结论与设备事先声明协议时**完全一致**
+  （有参数化测试逐条比对两条路径），排查时能直接定位；`evidence` 里的
+  设备/序号来自对坏帧的尽力、边界安全读取（device_id 非 ASCII 时用替换符
+  展示，读不出的字段不编造）。
+- **认不出**：例如魔数错误且又不是 JSON 的字节，register 视角 `BAD_MAGIC`、
+  structured 视角 `MALFORMED`，两边都认不出 -> `UNKNOWN_PROTOCOL`
+  （"我们不认识这是什么"），与坏帧分开计数、分开日志。
+- **歧义**：同一段字节同时像两种编码（两个解码器同时成功，或同时声称
+  认得出）-> `AMBIGUOUS_PROTOCOL`，绝不硬挑一种塞进去。
 - **指定协议的老路保持不变**：`protocol="register"` 时严格按 register
   解析，把 JSON 字节误标成 register 只会得到 register 的帧级拒绝，
   不会偷偷回退到 JSON 解析。
-- 非字节输入（如 str）按 `MALFORMED` 拒绝；全部拒绝结论计入
-  `decode_rejected`，并分别计入 `unidentified` / `ambiguous` 统计，
-  绝不静默丢弃。
+- 非字节输入（如 str）按 `MALFORMED` 拒绝。任何情况下都不静默丢弃；
+  坏帧只计入 `decode_rejected`，认不出另计 `unidentified`、歧义另计
+  `ambiguous`，三者在统计与 `/stats` 中分开。
 
 ## 2. 去重与窗口语义（每设备独立）
 
@@ -171,49 +193,85 @@ gw.policies.resolve("unknown-dev")  # -> ResolvedPolicy(32, 100, 'drop_newest')
 覆盖值非法（窗口 0、容量 0、拼错策略名、JSON 非法、键名未知等）在配置构造
 阶段即抛 `ValueError`，不会拖到数据流里才暴露。
 
+> 这些策略设置是**进程配置**，不会写进状态快照；重启恢复时以新进程自己的
+> 配置（环境变量/构造参数）为准，按设备覆盖、未覆盖回退全局缺省（见第 6 节）。
+
 ## 5. 拒绝原因一览
 
-`TRUNCATED_FRAME`、`BAD_MAGIC`、`CHECKSUM_MISMATCH`、`FIELD_MISSING`、
-`BAD_VALUE`、`MALFORMED`、`UNKNOWN_PROTOCOL`（自动识别：没有协议匹配）、
-`AMBIGUOUS_PROTOCOL`（自动识别：多种协议同时匹配）、`DUPLICATE_SEQ`、
-`OUT_OF_WINDOW`、`SEQ_ROLLBACK`、`BUFFER_OVERFLOW`——取值互不相同，
-日志与统计中可区分。
+- 帧级（指定协议路径，或自动路径下"唯一认得出但帧坏"）：
+  `TRUNCATED_FRAME`（长度不符/被截断）、`BAD_MAGIC`（帧头魔数错误）、
+  `CHECKSUM_MISMATCH`（校验失败）、`FIELD_MISSING`（必填字段缺失）、
+  `BAD_VALUE`（类型/取值非法）、`MALFORMED`（结构性无法解析/版本非法）；
+- 自动判别专属：`UNKNOWN_PROTOCOL`（没有任何已支持编码认得出）、
+  `AMBIGUOUS_PROTOCOL`（同时像两种编码，歧义）；
+- 时序/缓冲阶段：`DUPLICATE_SEQ`、`OUT_OF_WINDOW`、`SEQ_ROLLBACK`、
+  `BUFFER_OVERFLOW`。
 
-## 6. 重启后接着跑：本地状态快照
+以上取值互不相同，日志与统计中可区分；坏帧、认不出、歧义三类结论
+在自动路径下分开计数（`decode_rejected` / `unidentified` / `ambiguous`）。
 
-`edge_gateway/snapshot.py` 把网关**真实运行状态**落成一份本地 JSON 快照，
-并支持在全新进程中仅凭快照文件恢复：
+## 6. 重启后接着跑：纯运行状态快照（v2）
+
+`edge_gateway/snapshot.py` 把网关**纯运行状态**落成一份本地 JSON 快照，
+在全新进程中由调用进程按自己的配置重建网关后灌入状态：
 
 ```python
+from edge_gateway.config import GatewayConfig
 from edge_gateway.snapshot import save_snapshot, load_snapshot, restore_gateway
 
 save_snapshot(gw, "/var/lib/gw/state.json")          # 临时文件 + os.replace 原子写
 state = load_snapshot("/var/lib/gw/state.json")      # 全新进程
-gw = restore_gateway(state)                          # 用快照自带配置重建并恢复
+
+# 策略来自恢复进程自己的配置（含按设备覆盖），不从快照读取
+cfg = GatewayConfig(
+    window_size=8, spool_capacity=10,
+    device_policies={"line-A/temp": DevicePolicy(window_size=3)},
+)
+gw = restore_gateway(state, config=cfg)
 gw.on_downstream_recovered()                         # 继续补发缓存
+
+# 也可直接传 Gateway 构造参数（window_size/spool_capacity/overflow_policy/
+# device_policies），或先按目标配置建好网关再 state_to_gateway(gw, state)
 ```
 
-快照内容（白名单，**不含任何凭据/密钥/令牌/连接串**）：
+快照内容（v2，**只有运行状态 + 外壳**）：
 
-- `format` / `version` / `taken_at_ms`；
-- `config`：生效的窗口/容量/溢出策略与**按设备覆盖**——它是让恢复后判定
-  尺度与重启前一致所必需的策略参数，不是凭据；
+- `format` / `version`（=`edge-gateway-state` / `2`）/ `taken_at_ms`；
 - `sequencer`：每设备 `watermark`、`last_seen_seq`、窗口内已见序号集 `seen`；
-- `spool`：尚未补发的排队读数（保持全局 FIFO 顺序与字段）、已成功投递键、
-  缓冲计数；
-- `stats`：各类计数与水位表（含 `unidentified` / `ambiguous`）。
+- `spool`：尚未补发的排队读数（保持全局 FIFO 顺序与全部字段）、
+  已成功投递键、缓冲计数（含 `dropped_overflow`）；
+- `stats`：各类计数与水位表（`accepted/rejected/decode_rejected/duplicate/
+  out_of_window/rollback/overflow_dropped/delivered/unidentified/ambiguous`）。
+
+**策略设置不进快照**：窗口大小、缓冲容量、溢出策略以及按设备覆盖，一律
+由进程自己的配置决定（环境变量 / `GatewayConfig` / 构造参数）；按设备单独
+覆盖、没有单独设定的设备回退全局缺省值（见第 4 节）。因此同一份快照拿到
+不同策略的进程里恢复是允许的，恢复后的判定尺度以该进程配置为准。
+
+**恢复时的严格校验（任何层级违反都抛 `SnapshotError`，绝不静默接受）**：
+
+1. **白名单字段**：每个层级只允许上表列出的键。多出任何未知字段（例如
+   旧版快照里的 `config` 策略段、随手塞的 `extra`）都明确拒绝并说明位置；
+2. **凭据类内容**：任意层级出现 `password/passwd/secret/token/api_key/
+   credential/private_key/access_key` 等凭据样式键名（子串匹配，不区分
+   大小写），一律拒绝并报出位置——快照本来就不该出现凭据；
+3. **结构与类型**：format/version 必须匹配，计数器必须是非负整数，
+   排队读数字段必须完整、`value` 必须是有限数、`source` 必须是
+   `register`/`structured` 等；校验顺序上凭据优先于"未知字段"报告。
+   直接调用 `Gateway.load_state(export_state() 的纯运行状态)` 时执行同一套
+   校验（只是不要求 format/version 外壳）。
 
 恢复语义（有专门测试逐条断言）：
 
-1. **水位/已见序号接得上**：恢复后重放重启前已交给下游或仍在缓存排队的
-   读数，窗口内的一律 `DUPLICATE_SEQ`，水位**只增不减、不倒退**；
-2. **不重复投递/计数**：重启前已投递的键随快照恢复，作为补发幂等防线；
-   新进程下游为空，恢复后 `drain` 只会收到缓存里尚未投递的读数，恰好一次；
-3. **缓存接着补发**：排队读数、顺序与字段完整恢复；恢复后下游仍不可用时
-   容量/溢出策略继续按各设备生效；
-4. **配置一致性校验**：`state_to_gateway(existing_gateway, state)` 会比对
-   窗口/容量/溢出/设备覆盖，尺度不一致直接 `ValueError` 拒绝恢复，避免
-   换了策略后窗口语义错配；`restore_gateway(state)` 则直接用快照配置重建。
+1. **计数原样接续**：重启前发生的**丢弃（两种溢出策略都算）、投递、重复、
+   超窗、回退、认不出、歧义**等计数都进快照，恢复后逐一相等；
+2. **水位/已见序号接得上**：重放重启前已投递或仍在缓存排队的读数，窗口内
+   一律 `DUPLICATE_SEQ`，水位**只增不减、不倒退**；
+3. **不重复投递/计数**：重启前已投递的键随快照恢复，作为补发幂等防线；
+   恢复后 `drain` 只会投递缓存里尚未发出的读数，恰好一次；被
+   `drop_oldest` 腾退的旧读数不会复活；
+4. **缓存接着补发**：排队读数、顺序与字段完整恢复；恢复后下游仍不可用时，
+   容量/溢出策略按**恢复进程**对各设备的生效配置继续判定。
 
 ## 7. 本地验证方法
 
@@ -221,17 +279,17 @@ gw.on_downstream_recovered()                         # 继续补发缓存
 # 安装依赖（uv）
 uv sync
 
-# 端到端剧本：自动识别/指定协议、按设备策略、六类畸形帧、
-# 中断→按设备缓冲/溢出→落快照→全新对象恢复→补发
+# 端到端剧本：自动判别三结论（坏帧/认不出/歧义）、指定协议老路、
+# 按设备策略、六类畸形帧、中断→按设备缓冲/溢出→落快照→新进程恢复→补发
 uv run python main.py
 
-# 全部 69 个测试；加 -s 可查看每条序号/水位/判定依据日志
+# 全部 97 个测试；加 -s 可查看每条序号/水位/判定依据日志
 uv run pytest -s
 
-# 仅看本轮三类新增行为
-uv run pytest tests/test_identification.py -s   # 协议自行判别（7）
-uv run pytest tests/test_device_policy.py -s    # 按设备差异化策略（5）
-uv run pytest tests/test_snapshot.py -s         # 快照落盘/重启恢复（7）
+# 仅看本轮三类新增/修复行为
+uv run pytest tests/test_identification.py -s   # 自动判别：坏帧/认不出/歧义三类分别断言
+uv run pytest tests/test_device_policy.py -s    # 按设备差异化策略
+uv run pytest tests/test_snapshot.py -s         # 快照纯运行状态/严格拒绝/计数接续
 
 # 既有用例不回归
 uv run pytest tests/test_pipeline.py tests/test_sequencer.py \
@@ -263,6 +321,6 @@ curl -XPOST localhost:8000/recover
 | `tests/test_spool.py` | 容量上限、两种溢出策略、失败保留队首、FIFO 补发、并发一致（6） |
 | `tests/test_pipeline.py` | 双协议、乱序重复、9 类畸形帧、中断→恢复保序、重放不变、并发、抖动恢复、未知协议（8） |
 | `tests/test_config.py` | 默认值、环境覆盖、非法配置（5） |
-| `tests/test_identification.py` | 两类字节自动归一、老路不回退、认不出、坏帧不硬塞、歧义可区分且计数分离（7） |
+| `tests/test_identification.py` | 自动判别三结论分别断言：register/structured 各类坏帧（含 evidence 依据）与声明路径结论一致、真正认不出、两编码歧义、三类分开计数与日志、老路不回退（16） |
 | `tests/test_device_policy.py` | 缺省回退/稳定解析、窗口与容量按设备独立、重连一致、每设备 drop_oldest（5） |
-| `tests/test_snapshot.py` | 状态白名单无凭据、水位/序号集/缓存/计数恢复、重放不重复不回退、文件原子往返、配置错配拒绝、设备策略恢复、自动识别帧重放（7） |
+| `tests/test_snapshot.py` | 快照只含运行状态（无策略/凭据）、严格白名单与凭据键拒绝（含嵌套/旧 config 段/坏类型/坏版本）、水位/序号集/缓存恢复、重放不回退不重复、溢出丢弃（两种策略）与各类计数重启前后一致、策略随恢复进程配置与缺省回退、文件原子往返（26） |

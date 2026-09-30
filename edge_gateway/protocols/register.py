@@ -18,11 +18,19 @@
 合法帧总长 = 26 + N + M。
 
 拒绝判定顺序（确定性，便于复现）：
-    1) 不足 2 字节 / 头不足 / 总长不符 -> TRUNCATED_FRAME
-    2) magic 不符                       -> BAD_MAGIC
-    3) 版本不符                         -> MALFORMED
-    4) CRC 不符                         -> CHECKSUM_MISMATCH
-    5) 字段为空 / 非 ASCII              -> FIELD_MISSING / BAD_VALUE
+    1) 不足 2 字节                      -> TRUNCATED_FRAME（不可归属）
+    2) magic 不符                       -> BAD_MAGIC（不可归属：像别的东西）
+    3) 头不足 / 总长不符 / 被截断       -> TRUNCATED_FRAME（归属 register）
+    4) 版本不符                         -> MALFORMED（归属 register）
+    5) CRC 不符                         -> CHECKSUM_MISMATCH（归属 register）
+    6) 字段为空 / 非 ASCII              -> FIELD_MISSING / BAD_VALUE（归属）
+
+归属语义（供协议自行判别使用）：
+    magic 一旦对得上 0xA55A，就足以确认这是一帧寄存器报文；此后无论版本、
+    长度、CRC 还是字段出了什么问题，结论都是"register 坏帧"
+    （attributable=True），而不是"认不出是什么协议"。帧里能安全读出的
+    device_id/seq 会作为 evidence 一并带出，供现场排查定位。
+    帧不足 2 字节、或 magic 不符，则不能归到 register 头上。
 """
 
 from __future__ import annotations
@@ -82,6 +90,31 @@ def encode_register_frame(
     return body + struct.pack("<H", crc)
 
 
+def _extract_evidence(data: bytes, dev_len: int) -> dict:
+    """从一帧 magic/version 已确认的（可能已坏的）报文中尽力读依据。
+
+    只读定长、边界安全的字段，任何不确定的部分一律不放进结果；
+    device_id 允许非 ASCII（替换符展示），因为 BAD_VALUE 场景下
+    现场恰恰需要看到是哪台设备的字节坏了。
+    """
+    evidence: dict = {}
+    if 6 + dev_len <= len(data):
+        raw_dev = data[6:6 + dev_len]
+        evidence["device_id"] = raw_dev.decode("ascii", errors="replace")
+        if len(data) >= 6 + dev_len + 4:
+            evidence["seq"] = struct.unpack_from("<I", data, 6 + dev_len)[0]
+    return evidence
+
+
+def _bad(reason: RejectReason, detail: str, evidence: dict | None = None):
+    """属于 register 的坏帧：自动判别时按 register 自己的结论上报。"""
+    return DecodeResult(
+        ok=False, reason=reason, detail=detail,
+        attributable=True, protocol="register",
+        evidence=evidence or None,
+    )
+
+
 class RegisterFrameDecoder:
     """解码寄存器风格帧并归一为 Reading。"""
 
@@ -96,81 +129,90 @@ class RegisterFrameDecoder:
         data = bytes(raw)
         n = len(data)
 
+        # 不足 2 字节：连魔数都无从判断，不能归到任何协议
         if n < 2:
             return DecodeResult(
                 ok=False, reason=RejectReason.TRUNCATED_FRAME,
                 detail=f"frame shorter than magic: {n} bytes",
             )
-        if struct.unpack_from("<H", data, 0)[0] != MAGIC:
+        magic = struct.unpack_from("<H", data, 0)[0]
+        if magic != MAGIC:
+            # 魔数不符：这串字节不像寄存器帧，归属留给别的协议/判未知
             return DecodeResult(
                 ok=False, reason=RejectReason.BAD_MAGIC,
-                detail=f"bad magic: 0x{struct.unpack_from('<H', data, 0)[0]:04X}",
+                detail=f"bad magic: 0x{magic:04X}",
             )
+
+        # magic 已对上：以下任何失败都是"register 帧坏了"
         if n < 6:
-            return DecodeResult(
-                ok=False, reason=RejectReason.TRUNCATED_FRAME,
-                detail=f"header incomplete: {n} bytes < 6",
+            return _bad(
+                RejectReason.TRUNCATED_FRAME,
+                f"header incomplete: {n} bytes < 6",
             )
 
         version, flags, dev_len = struct.unpack_from("<BBH", data, 2)
+        evidence = _extract_evidence(data, dev_len)
         if version != VERSION:
-            return DecodeResult(
-                ok=False, reason=RejectReason.MALFORMED,
-                detail=f"unsupported version: 0x{version:02X}",
+            return _bad(
+                RejectReason.MALFORMED,
+                f"unsupported version: 0x{version:02X}", evidence,
             )
 
         expected = _MIN_LEN + dev_len
         if n < expected:
-            return DecodeResult(
-                ok=False, reason=RejectReason.TRUNCATED_FRAME,
-                detail=f"length mismatch: need metric_len/value/crc, "
-                       f"got {n} < {expected} (dev_len={dev_len})",
+            return _bad(
+                RejectReason.TRUNCATED_FRAME,
+                f"length mismatch: need metric_len/value/crc, "
+                f"got {n} < {expected} (dev_len={dev_len})",
+                evidence,
             )
 
         off = 6 + dev_len
         seq, ts, met_len = struct.unpack_from("<IQH", data, off)
+        evidence.setdefault("seq", seq)
         expected = 26 + dev_len + met_len
         if n != expected:
-            return DecodeResult(
-                ok=False, reason=RejectReason.TRUNCATED_FRAME,
-                detail=f"length mismatch: got {n} != {expected} "
-                       f"(dev_len={dev_len}, metric_len={met_len})",
+            return _bad(
+                RejectReason.TRUNCATED_FRAME,
+                f"length mismatch: got {n} != {expected} "
+                f"(dev_len={dev_len}, metric_len={met_len})",
+                evidence,
             )
 
         crc_want = crc16_modbus(data[:-2])
         crc_got = struct.unpack_from("<H", data, n - 2)[0]
         if crc_got != crc_want:
-            return DecodeResult(
-                ok=False, reason=RejectReason.CHECKSUM_MISMATCH,
-                detail=f"crc16 mismatch: frame=0x{crc_got:04X} "
-                       f"calc=0x{crc_want:04X}",
+            return _bad(
+                RejectReason.CHECKSUM_MISMATCH,
+                f"crc16 mismatch: frame=0x{crc_got:04X} calc=0x{crc_want:04X}",
+                evidence,
             )
 
         try:
             device_id = data[6:6 + dev_len].decode("ascii")
         except UnicodeDecodeError as exc:
-            return DecodeResult(
-                ok=False, reason=RejectReason.BAD_VALUE,
-                detail=f"device_id not ascii: {exc}",
+            return _bad(
+                RejectReason.BAD_VALUE,
+                f"device_id not ascii: {exc}", evidence,
             )
+        evidence["device_id"] = device_id
         metric_off = off + 14  # seq(4)+ts(8)+mlen(2)
         try:
             metric = data[metric_off:metric_off + met_len].decode("ascii")
         except UnicodeDecodeError as exc:
-            return DecodeResult(
-                ok=False, reason=RejectReason.BAD_VALUE,
-                detail=f"metric not ascii: {exc}",
+            return _bad(
+                RejectReason.BAD_VALUE,
+                f"metric not ascii: {exc}", evidence,
             )
 
         if not device_id:
-            return DecodeResult(
-                ok=False, reason=RejectReason.FIELD_MISSING,
-                detail="empty device_id",
+            return _bad(
+                RejectReason.FIELD_MISSING, "empty device_id", evidence,
             )
         if not metric:
-            return DecodeResult(
-                ok=False, reason=RejectReason.FIELD_MISSING,
-                detail=f"empty metric (device={device_id}, seq={seq})",
+            return _bad(
+                RejectReason.FIELD_MISSING,
+                f"empty metric (device={device_id}, seq={seq})", evidence,
             )
 
         val_off = metric_off + met_len

@@ -4,17 +4,31 @@
 识别并归一到同一套读数模型。
 
 判定原则（绝不瞎猜、绝不静默丢弃）：
-    恰好一种协议解码成功  -> 接受，Reading.source 标明命中协议
-    没有任何协议成功      -> UNKNOWN_PROTOCOL（结论与各类帧级拒绝不同，
-                            即"我们认不出这是什么"，而非某协议的坏帧）
-    两种及以上同时成功    -> AMBIGUOUS_PROTOCOL（歧义，硬塞任何一种都可能
-                            错，必须由明确拒绝暴露出来）
+    恰好一种协议解码成功    -> 接受，Reading.source 标明命中协议
+    仅一种协议"认得出但帧坏" -> 给出该协议自己的、可区分的坏帧结论
+                               （CHECKSUM_MISMATCH/TRUNCATED_FRAME/
+                               FIELD_MISSING/BAD_VALUE/MALFORMED 等），
+                               并带上能从坏帧读出的 device_id/seq 等依据；
+                               绝不一概回成"认不出"
+    没有任何协议认得出      -> UNKNOWN_PROTOCOL（"我们不认识这是什么"，
+                               与某协议的坏帧是两回事，分开计数、分开日志）
+    两种及以上同时成功，或
+      两种及以上同时认得出   -> AMBIGUOUS_PROTOCOL（歧义：硬塞任何一种都
+      （但都坏了）             可能错，必须明确拒绝），与"认不出"分开计数
+
+"认得出"的标准由各解码器用 DecodeResult.attributable 声明：
+    register  —— magic 0xA55A 对上即归属（此后版本/长度/CRC/字段问题都是
+                 register 坏帧）；magic 不符或短于 2 字节则不归属。
+    structured —— 字节能解析成 JSON 对象即归属（此后缺字段/非法值都是
+                 structured 坏帧）；非 JSON 或顶层不是对象则不归属。
 
 为让结论可解释，detail 中固定携带：参与尝试的协议、各自的拒绝原因、
-命中数量。
+命中/归属数量。
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 from ..models import DecodeResult, RejectReason
 from .register import RegisterFrameDecoder
@@ -30,7 +44,7 @@ def default_decoders():
 
 
 class ProtocolIdentifier:
-    """依次尝试已注册解码器，按"唯一命中"原则判定。"""
+    """依次尝试已注册解码器，按"唯一命中/唯一归属"原则判定。"""
 
     def __init__(self, decoders) -> None:
         if not decoders:
@@ -49,23 +63,27 @@ class ProtocolIdentifier:
             )
 
         hits: list = []
+        attributed: list[tuple[str, DecodeResult]] = []
         failures: list[tuple[str, RejectReason | None, str]] = []
         for decoder in self._decoders:
             result = decoder.decode(raw)
             if result.ok and result.reading is not None:
                 hits.append((decoder.name, result.reading))
+            elif result.attributable and result.reason is not None:
+                name = result.protocol or decoder.name
+                attributed.append((name, result))
+                failures.append((name, result.reason, result.detail))
             else:
                 failures.append(
                     (decoder.name, result.reason, result.detail),
                 )
 
         tried = ", ".join(d.name for d in self._decoders)
-        if len(hits) == 1:
-            name, reading = hits[0]
-            return DecodeResult(
-                ok=True, reading=reading,
-                detail=f"protocol identified as {name!r} (tried: {tried})",
-            )
+        breakdown = "; ".join(
+            f"{name}: {(reason.value if reason else 'UNKNOWN')}({detail})"
+            for name, reason, detail in failures
+        )
+
         if len(hits) >= 2:
             names = ", ".join(name for name, _ in hits)
             return DecodeResult(
@@ -75,12 +93,34 @@ class ProtocolIdentifier:
                     f"[{names}]; cannot pick one safely (tried: {tried})"
                 ),
             )
+        if len(hits) == 1:
+            name, reading = hits[0]
+            return DecodeResult(
+                ok=True, reading=reading,
+                detail=f"protocol identified as {name!r} (tried: {tried})",
+            )
 
-        breakdown = "; ".join(
-            f"{name}: {(reason.value if reason else 'UNKNOWN')}"
-            f"({detail})"
-            for name, reason, detail in failures
-        )
+        if len(attributed) >= 2:
+            names = ", ".join(name for name, _ in attributed)
+            return DecodeResult(
+                ok=False, reason=RejectReason.AMBIGUOUS_PROTOCOL,
+                detail=(
+                    f"payload looks like a corrupt frame of "
+                    f"{len(attributed)} protocols at once: [{names}]; "
+                    f"cannot attribute safely (tried: {tried}); "
+                    f"per-decoder result -> {breakdown}"
+                ),
+            )
+        if len(attributed) == 1:
+            name, result = attributed[0]
+            return replace(
+                result,
+                detail=(
+                    f"corrupt {name!r} frame under auto-detection "
+                    f"(tried: {tried}): {result.detail}"
+                ),
+            )
+
         return DecodeResult(
             ok=False, reason=RejectReason.UNKNOWN_PROTOCOL,
             detail=(

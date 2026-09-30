@@ -40,12 +40,24 @@ class Reading:
 
 @dataclass(frozen=True, slots=True)
 class DecodeResult:
-    """协议解码结果：成功携带 reading，失败携带可区分原因。"""
+    """协议解码结果：成功携带 reading，失败携带可区分原因。
+
+    自动判别场景下，失败结果还需回答两个问题：
+        attributable  这串字节是否"足以确认属于本协议，只是帧坏了"。
+                      True  -> 自动判别应给出本协议自己的坏帧结论；
+                      False -> 只是"不像本协议"，不能据此归属。
+        protocol      归属协议名（attributed failure 时由识别器补上）。
+        evidence      能从坏帧里尽力读出的依据（device_id/seq 等），
+                      供日志与排查使用；读不出的字段不出现在字典里。
+    """
 
     ok: bool
     reading: Reading | None = None
     reason: RejectReason | None = None
     detail: str = ""
+    attributable: bool = False
+    protocol: str | None = None
+    evidence: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)

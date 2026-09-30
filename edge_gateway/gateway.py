@@ -4,8 +4,15 @@
     指定协议（老路）  RawMessage.protocol 为 "register"/"structured"，
                       严格按该协议解码；未知协议名 -> MALFORMED。
     协议自行判别      RawMessage.protocol 为 identification.AUTO_PROTOCOL，
-                      网关对原始字节自行识别：唯一命中才接受；认不出 ->
-                      UNKNOWN_PROTOCOL；多种协议同时像 -> AMBIGUOUS_PROTOCOL。
+                      网关对原始字节自行识别：
+                        * 唯一解码成功 -> 接受；
+                        * 唯一"认得出但帧坏" -> 该协议自己的、可区分的
+                          坏帧结论（校验失败/截断/缺字段/非法值…），并带
+                          上能读出的设备、序号依据；
+                        * 认不出 -> UNKNOWN_PROTOCOL；
+                        * 同时像两种（解码成功或都认得出）->
+                          AMBIGUOUS_PROTOCOL，与认不出分开计数、分开日志。
+                      任何情况下都不静默丢弃、不二选一硬塞。
 
 按设备策略：
     窗口大小、缓冲容量、溢出策略均通过 DevicePolicyResolver 按 device_id
@@ -50,7 +57,8 @@ class IngestResult:
     watermark: int | None = None
     delivered: bool = False
     buffered: bool = False
-    protocol: str = ""              # 指定协议；自动识别时为命中的协议名
+    protocol: str = ""              # 指定协议；自动识别时为命中/归属的协议名
+    evidence: dict | None = None    # 坏帧里尽力读出的依据（device_id/seq 等）
 
 
 @dataclass
@@ -140,99 +148,128 @@ class Gateway:
 
             # 1) 协议解码归一（指定协议老路 / 自动识别新路）
             if msg.protocol == AUTO_PROTOCOL:
-                identified = self.identifier.identify(msg.payload)
-                if not identified.ok or identified.reading is None:
-                    return self._reject_identify(
-                        identified.reason or RejectReason.UNKNOWN_PROTOCOL,
-                        identified.detail,
-                    )
-                reading = identified.reading
-                protocol = reading.source
-            else:
-                decoder = self._decoders.get(msg.protocol)
-                if decoder is None:
-                    return self._reject_decode(
-                        RejectReason.MALFORMED,
-                        f"unknown protocol: {msg.protocol!r}",
-                    )
-                decoded = decoder.decode(msg.payload)
-                if not decoded.ok or decoded.reading is None:
-                    return self._reject_decode(
-                        decoded.reason or RejectReason.MALFORMED,
-                        decoded.detail,
-                    )
-                reading = decoded.reading
-                protocol = msg.protocol
+                return self._ingest_auto(msg)
 
-            # 2) 设备时序判定（幂等/窗口/水位，窗口按设备解析）
-            decision = self.sequencer.check(reading.device_id, reading.seq)
-            wm = decision.watermark_after
-            self.stats.watermarks[reading.device_id] = wm
-            if not decision.accepted:
-                self.stats.rejected += 1
-                reason = decision.reason or RejectReason.DUPLICATE_SEQ
-                if reason is RejectReason.DUPLICATE_SEQ:
-                    self.stats.duplicate += 1
-                elif reason is RejectReason.OUT_OF_WINDOW:
-                    self.stats.out_of_window += 1
-                elif reason is RejectReason.SEQ_ROLLBACK:
-                    self.stats.rollback += 1
-                return IngestResult(
-                    ok=False, stage="sequence", reason=reason,
-                    detail=(
-                        f"seq={reading.seq} rejected by device window policy "
-                        f"(watermark={decision.watermark_before}, "
-                        f"window={self.policies.window_for(reading.device_id)})"
-                    ),
-                    device_id=reading.device_id, seq=reading.seq,
-                    watermark=wm, protocol=protocol,
+            decoder = self._decoders.get(msg.protocol)
+            if decoder is None:
+                return self._reject_decode(
+                    RejectReason.MALFORMED,
+                    f"unknown protocol: {msg.protocol!r}",
                 )
-
-            # 3) 已被时序层接受：尝试下游直投，失败则入边界缓冲
-            self.stats.accepted += 1
-            if self.downstream.available:
-                try:
-                    self.downstream.deliver(reading)
-                    self.stats.delivered += 1
-                    return IngestResult(
-                        ok=True, stage="delivered",
-                        device_id=reading.device_id, seq=reading.seq,
-                        watermark=wm, delivered=True, protocol=protocol,
-                    )
-                except DownstreamUnavailable:
-                    pass  # 竞态：检查后被置为不可用，落入缓冲
-
-            accepted, reason = self.spool.put(reading)
-            if not accepted:
-                self.stats.rejected += 1
-                cap = self.policies.spool_capacity_for(reading.device_id)
-                pol = self.policies.overflow_policy_for(reading.device_id)
-                return IngestResult(
-                    ok=False, stage="buffer",
-                    reason=RejectReason.BUFFER_OVERFLOW,
-                    detail=(
-                        f"spool full for device {reading.device_id!r} "
-                        f"(capacity={cap}, policy={pol})"
-                    ),
-                    device_id=reading.device_id, seq=reading.seq,
-                    watermark=wm, protocol=protocol,
+            decoded = decoder.decode(msg.payload)
+            if not decoded.ok or decoded.reading is None:
+                return self._reject_decode(
+                    decoded.reason or RejectReason.MALFORMED,
+                    decoded.detail,
                 )
+            reading = decoded.reading
+            protocol = msg.protocol
+
+            return self._ingest_reading(reading, protocol)
+
+    def _ingest_auto(self, msg: RawMessage) -> IngestResult:
+        """自动判别路径：命中则进时序/缓冲；否则按三类结论分别拒绝。"""
+        identified = self.identifier.identify(msg.payload)
+        if identified.ok and identified.reading is not None:
+            return self._ingest_reading(
+                identified.reading, identified.reading.source,
+            )
+        reason = identified.reason or RejectReason.UNKNOWN_PROTOCOL
+        return self._reject_identify(reason, identified)
+
+    def _ingest_reading(self, reading, protocol: str) -> IngestResult:
+        """已归一读数的时序判定 + 直投/缓冲（两条接入路径共用）。"""
+        # 2) 设备时序判定（幂等/窗口/水位，窗口按设备解析）
+        decision = self.sequencer.check(reading.device_id, reading.seq)
+        wm = decision.watermark_after
+        self.stats.watermarks[reading.device_id] = wm
+        if not decision.accepted:
+            self.stats.rejected += 1
+            reason = decision.reason or RejectReason.DUPLICATE_SEQ
+            if reason is RejectReason.DUPLICATE_SEQ:
+                self.stats.duplicate += 1
+            elif reason is RejectReason.OUT_OF_WINDOW:
+                self.stats.out_of_window += 1
+            elif reason is RejectReason.SEQ_ROLLBACK:
+                self.stats.rollback += 1
             return IngestResult(
-                ok=True, stage="buffer",
+                ok=False, stage="sequence", reason=reason,
+                detail=(
+                    f"seq={reading.seq} rejected by device window policy "
+                    f"(watermark={decision.watermark_before}, "
+                    f"window={self.policies.window_for(reading.device_id)})"
+                ),
                 device_id=reading.device_id, seq=reading.seq,
-                watermark=wm, buffered=True, protocol=protocol,
+                watermark=wm, protocol=protocol,
             )
 
-    def _reject_identify(self, reason: RejectReason, detail: str) -> IngestResult:
-        """自动识别阶段的可区分拒绝（认不出 / 歧义分开计数）。"""
-        if reason is RejectReason.AMBIGUOUS_PROTOCOL:
-            self.stats.ambiguous += 1
-        else:
-            self.stats.unidentified += 1
+        # 3) 已被时序层接受：尝试下游直投，失败则入边界缓冲
+        self.stats.accepted += 1
+        if self.downstream.available:
+            try:
+                self.downstream.deliver(reading)
+                self.stats.delivered += 1
+                return IngestResult(
+                    ok=True, stage="delivered",
+                    device_id=reading.device_id, seq=reading.seq,
+                    watermark=wm, delivered=True, protocol=protocol,
+                )
+            except DownstreamUnavailable:
+                pass  # 竞态：检查后被置为不可用，落入缓冲
+
+        dropped_before = self.spool.stats.dropped_overflow
+        accepted, reason = self.spool.put(reading)
+        # 无论 DROP_NEWEST（拒绝新读数）还是 DROP_OLDEST（腾退旧读数），
+        # 真实发生的溢出丢弃都必须进网关计数与快照
+        dropped_delta = self.spool.stats.dropped_overflow - dropped_before
+        if dropped_delta:
+            self.stats.overflow_dropped += dropped_delta
+        if not accepted:
+            self.stats.rejected += 1
+            cap = self.policies.spool_capacity_for(reading.device_id)
+            pol = self.policies.overflow_policy_for(reading.device_id)
+            return IngestResult(
+                ok=False, stage="buffer",
+                reason=RejectReason.BUFFER_OVERFLOW,
+                detail=(
+                    f"spool full for device {reading.device_id!r} "
+                    f"(capacity={cap}, policy={pol})"
+                ),
+                device_id=reading.device_id, seq=reading.seq,
+                watermark=wm, protocol=protocol,
+            )
+        return IngestResult(
+            ok=True, stage="buffer",
+            device_id=reading.device_id, seq=reading.seq,
+            watermark=wm, buffered=True, protocol=protocol,
+        )
+
+    def _reject_identify(self, reason: RejectReason, result) -> IngestResult:
+        """自动识别阶段的三类结论：归属坏帧 / 认不出 / 歧义，分开计数。"""
         self.stats.rejected += 1
         self.stats.decode_rejected += 1
+        if reason is RejectReason.AMBIGUOUS_PROTOCOL:
+            self.stats.ambiguous += 1
+        elif reason is RejectReason.UNKNOWN_PROTOCOL:
+            self.stats.unidentified += 1
+        # 其它原因：认得出归属协议、但帧本身坏了，按该协议结论上报，
+        # 只计入 decode_rejected，不进 unidentified/ambiguous。
+        evidence = result.evidence or None
+        if evidence and "device_id" in evidence:
+            device_id = str(evidence["device_id"])
+        else:
+            device_id = ""
+        seq = evidence.get("seq") if evidence else None
+        protocol = result.protocol or ""
+        seq_out = (
+            int(seq)
+            if isinstance(seq, int) and not isinstance(seq, bool)
+            else None
+        )
         return IngestResult(
-            ok=False, stage="identify", reason=reason, detail=detail,
+            ok=False, stage="identify", reason=reason, detail=result.detail,
+            device_id=device_id, seq=seq_out,
+            protocol=protocol, evidence=evidence,
         )
 
     def on_downstream_recovered(self) -> int:
@@ -272,26 +309,35 @@ class Gateway:
             }
 
     def load_state(self, state: dict) -> None:
-        """从快照恢复运行状态（需用相同配置新建网关后再调用）。"""
+        """从快照恢复运行状态（需用相同策略尺度新建网关后再调用）。
+
+        严格校验：只接受运行状态白名单字段，任何未知字段或凭据类内容
+        一律拒绝（见 snapshot.validate_runtime_state）。
+        """
+        from .snapshot import validate_runtime_state
+
+        validate_runtime_state(state, envelope=False)
         with self._lock:
             self.sequencer.load_state(state["sequencer"])
             self.spool.load_state(state["spool"])
-            st = state.get("stats", {})
-            wm = st.get("watermarks", {})
+            st = state["stats"]
+            wm = st["watermarks"]
             self.stats = GatewayStats(
-                total_in=int(st.get("total_in", 0)),
-                accepted=int(st.get("accepted", 0)),
-                rejected=int(st.get("rejected", 0)),
-                decode_rejected=int(st.get("decode_rejected", 0)),
-                duplicate=int(st.get("duplicate", 0)),
-                out_of_window=int(st.get("out_of_window", 0)),
-                rollback=int(st.get("rollback", 0)),
-                overflow_dropped=int(st.get("overflow_dropped", 0)),
-                delivered=int(st.get("delivered", 0)),
-                unidentified=int(st.get("unidentified", 0)),
-                ambiguous=int(st.get("ambiguous", 0)),
+                total_in=int(st["total_in"]),
+                accepted=int(st["accepted"]),
+                rejected=int(st["rejected"]),
+                decode_rejected=int(st["decode_rejected"]),
+                duplicate=int(st["duplicate"]),
+                out_of_window=int(st["out_of_window"]),
+                rollback=int(st["rollback"]),
+                overflow_dropped=int(st["overflow_dropped"]),
+                delivered=int(st["delivered"]),
+                unidentified=int(st["unidentified"]),
+                ambiguous=int(st["ambiguous"]),
                 watermarks={k: int(v) for k, v in wm.items()},
             )
+            # 溢出丢弃计数以缓冲内部计数为准，保证两边始终对得上
+            self.stats.overflow_dropped = self.spool.stats.dropped_overflow
 
     def stats_snapshot(self) -> GatewayStats:
         """汇总统计快照（含水位表与缓冲统计）。"""
@@ -304,7 +350,7 @@ class Gateway:
                 duplicate=self.stats.duplicate,
                 out_of_window=self.stats.out_of_window,
                 rollback=self.stats.rollback,
-                overflow_dropped=self.spool.stats.dropped_overflow,
+                overflow_dropped=self.stats.overflow_dropped,
                 delivered=self.stats.delivered,
                 unidentified=self.stats.unidentified,
                 ambiguous=self.stats.ambiguous,

@@ -37,15 +37,16 @@ def _print_result(result, label: str) -> None:
 def run_demo() -> None:
     """跑一遍确定性剧本并打印结论与最终统计。"""
     config = config_from_env()
+    policy_overrides = {
+        # line-A 用更窄窗口；line-B 下线缓冲更短且满了丢最旧
+        "line-A/temp": DevicePolicy(window_size=3),
+        "line-B/vibe": DevicePolicy(
+            spool_capacity=2, overflow_policy="drop_oldest",
+        ),
+    }
     gw = Gateway(
         config=config, window_size=8, spool_capacity=4,
-        device_policies={
-            # line-A 用更窄窗口；line-B 下线缓冲更短且满了丢最旧
-            "line-A/temp": DevicePolicy(window_size=3),
-            "line-B/vibe": DevicePolicy(
-                spool_capacity=2, overflow_policy="drop_oldest",
-            ),
-        },
+        device_policies=policy_overrides,
     )
     reg_dev = SimulatedDevice("line-A/temp", protocol="register")
     json_dev = SimulatedDevice("line-B/vibe", protocol="structured")
@@ -62,14 +63,53 @@ def run_demo() -> None:
                 reg_dev.emit_auto(0)):
         _print_result(gw.ingest(msg), msg.label)
 
-    print("=== 1b) 认不出 / 指定协议老路仍然可用 ===")
+    print("=== 1b) 自动判别：认得出但帧坏 / 认不出 / 歧义 三种结论 ===")
     from edge_gateway.devices import RawMessage
-    from edge_gateway.protocols.identification import AUTO_PROTOCOL
+    from edge_gateway.models import DecodeResult, RejectReason
+    from edge_gateway.protocols.identification import (
+        AUTO_PROTOCOL,
+        ProtocolIdentifier,
+    )
 
+    # 认得出是 register、但 CRC 坏了：给 register 自己的结论，并带设备/序号
+    msg = reg_dev.emit_auto(2, corrupt="bad_crc")
+    _print_result(gw.ingest(msg), msg.label)
+    # JSON 对象缺字段：给 structured 自己的 FIELD_MISSING，而不是"认不出"
+    msg = json_dev.emit_auto(1, corrupt="missing_field")
+    _print_result(gw.ingest(msg), msg.label)
+    # 真正认不出：两种编码都对不上
     _print_result(
         gw.ingest(RawMessage(AUTO_PROTOCOL, b"\x00\x01not-anything", "?")),
         "unidentified bytes",
     )
+    # 歧义：同一段字节同时像两种编码（用桩解码器稳定构造）
+    real_identifier = gw.identifier
+
+    class _Stub:
+        def __init__(self, name, result):
+            self.name = name
+            self._result = result
+
+        def decode(self, raw):
+            return self._result
+
+    gw.identifier = ProtocolIdentifier([
+        _Stub("register", DecodeResult(
+            ok=False, reason=RejectReason.CHECKSUM_MISMATCH, detail="crc",
+            attributable=True, protocol="register",
+            evidence={"device_id": "line-A/temp", "seq": 99})),
+        _Stub("structured", DecodeResult(
+            ok=False, reason=RejectReason.FIELD_MISSING, detail="missing",
+            attributable=True, protocol="structured",
+            evidence={"device_id": "line-A/temp", "seq": 99})),
+    ])
+    _print_result(
+        gw.ingest(RawMessage(AUTO_PROTOCOL, b"ambiguous-bytes", "!?")),
+        "ambiguous corrupt bytes",
+    )
+    gw.identifier = real_identifier
+
+    print("=== 1c) 指定协议老路仍然可用 ===")
     _print_result(gw.ingest(reg_dev.emit(2)), reg_dev.emit(2).label)
 
     print("=== 2) 重复序号（只计一次）===")
@@ -105,9 +145,15 @@ def run_demo() -> None:
         print(
             f"  snapshot: format={disk['format']} v{disk['version']} "
             f"watermarks={disk['stats']['watermarks']} "
-            f"queued={len(disk['spool']['queued'])}"
+            f"queued={len(disk['spool']['queued'])} "
+            f"overflow_dropped={disk['stats']['overflow_dropped']}"
         )
-        gw2 = restore_gateway(disk)  # 等价于在全新进程里重建
+        # 快照只含纯运行状态；策略由新进程自己的配置决定（含按设备覆盖）
+        gw2 = restore_gateway(
+            disk, config=config,
+            window_size=8, spool_capacity=4,
+            device_policies=policy_overrides,
+        )
         # 重放重启前数据：水位不倒退；窗口内序号 DUPLICATE_SEQ，
         # 过窄窗口外的更旧序号依旧 OUT_OF_WINDOW/ROLLBACK，绝不重新投递
         for s in (0, 1, 3, 4, 5, 6):
